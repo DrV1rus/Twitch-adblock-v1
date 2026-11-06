@@ -1,4 +1,6 @@
-Originally forked from pixeltris/TwitchAdSolutions (archived).
+Originally was intended to use as a fork from pixeltris/TwitchAdSolutions (archived).
+Due to unknown issues with the fork process, it was made as a separate with credits given to the developers that made it work until present day.
+
 
 TwitchAdSolutions
 Crecits go to pixeltris, ryanbr and  CommanderRoo for creating and maintaining the twitch adblock & quality userscripts.
