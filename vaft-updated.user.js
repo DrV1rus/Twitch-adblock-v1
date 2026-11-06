@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         TwitchAdSolutions - VAFT + Auto Best Quality
+// @name         TwitchAdSolutions - VAFT + Auto Best Quality 
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
-// @version      69.3.3
-// @description  blocks Twitch ads without breaking web-player & keeps best stream quality (Source)
-// @author       DrV1rus
+// @version      69.3.4
+// @description  Блокирует видеорекламу Twitch (VAFT) без поломки веб-плеера и удерживает наилучшее качество видео 
+// @author       pixeltris / ryanbr / CommanderRoot (fixed)
 // @match        *://*.twitch.tv/*
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
@@ -135,8 +135,16 @@
 
             const currentQuality = typeof player.getQuality === 'function' ? player.getQuality() : null;
             const isAuto = typeof player.isAutoQualityMode === 'function' ? player.isAutoQualityMode() : false;
-            const needsChange = isAuto || !currentQuality || currentQuality.group !== targetQuality.group;
-            if (!needsChange) return;
+            const groupMismatch = !currentQuality || currentQuality.group !== targetQuality.group;
+            if (!groupMismatch) {
+                // Качество уже верное: только выключаем авто-режим, без смены потока
+                if (isAuto && typeof player.setAutoQualityMode === 'function') {
+                    try {
+                        player.setAutoQualityMode(false);
+                    } catch (e) {}
+                }
+                return;
+            }
 
             // Анти-«дребезг»: не переключаем качество чаще, чем раз в QualityApplyCooldown
             const now = Date.now();
@@ -415,6 +423,7 @@
                     const ourTwitchAdSolutionsVersion = ${ourTwitchAdSolutionsVersion};
                     ${getStreamUrlForResolution.toString()}
                     ${getStreamForResolution.toString()}
+                    ${fetchTextWithTimeout.toString()}
                     ${stripUnusedParams.toString()}
                     ${hookWorkerFetch.toString()}
                     ${ublockProcessM3U8.toString()}
@@ -658,6 +667,20 @@
         return encodingsM3u8;
     }
 
+    // fetch + чтение тела с жёстким таймаутом. Зависший запрос к резервному потоку
+    // иначе блокирует ответ на запрос плейлиста плеера -> ошибка #2000.
+    async function fetchTextWithTimeout(realFetch, url, options, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await realFetch(url, Object.assign({}, options || {}, { signal: controller.signal }));
+            const text = await response.text();
+            return { status: response.status, text: text };
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     function getStreamUrlForResolution(encodingsM3u8, resolutionInfo) {
         const encodingsLines = encodingsM3u8.replace(/\r/g, '').split('\n');
         let firstUrl = null;
@@ -689,6 +712,13 @@
     }
 
     async function getStreamForResolution(streamInfo, resolutionInfo, encodingsM3u8, fallbackStreamStr, playerType, realFetch) {
+        // Если этот тип плеера недавно не сработал — не тратим время на повтор
+        streamInfo.FailedPlayerTypes = streamInfo.FailedPlayerTypes || {};
+        const failedAt = streamInfo.FailedPlayerTypes[playerType];
+        if (failedAt && Date.now() - failedAt < 10000) {
+            return { PlayerType: null, M3U8: fallbackStreamStr };
+        }
+
         let playerTypes = streamInfo.EncodingsM3U8Cache[playerType];
         if (playerTypes) {
             if (Date.now() - playerTypes.RequestTime <= 15000) {
@@ -708,9 +738,9 @@
                         const urlInfo = new URL(`https://usher.ttvnw.net/api/${V2API ? 'v2/' : ''}channel/hls/${streamInfo.ChannelName}.m3u8${streamInfo.UsherParams}`);
                         urlInfo.searchParams.set('sig', tokenData.signature);
                         urlInfo.searchParams.set('token', tokenData.value);
-                        const encodingsM3u8Response = await realFetch(urlInfo.href);
+                        const encodingsM3u8Response = await fetchTextWithTimeout(realFetch, urlInfo.href, undefined, 4000);
                         if (encodingsM3u8Response.status === 200) {
-                            encodingsM3u8 = await encodingsM3u8Response.text();
+                            encodingsM3u8 = encodingsM3u8Response.text;
                             streamInfo.EncodingsM3U8Cache[playerType] = {
                                 RequestTime: Date.now(),
                                 Value: encodingsM3u8
@@ -721,15 +751,18 @@
             } catch (err) {
                 console.warn(`[VAFT] Не удалось получить токен для типа плеера ${playerType}:`, err);
             }
+            if (!encodingsM3u8) {
+                streamInfo.FailedPlayerTypes[playerType] = Date.now();
+            }
         }
 
         if (encodingsM3u8) {
             try {
                 const streamUrl = getStreamUrlForResolution(encodingsM3u8, resolutionInfo);
                 if (streamUrl) {
-                    const streamResponse = await realFetch(streamUrl);
+                    const streamResponse = await fetchTextWithTimeout(realFetch, streamUrl, undefined, 4000);
                     if (streamResponse.status === 200) {
-                        const m3u8Text = await streamResponse.text();
+                        const m3u8Text = streamResponse.text;
                         if (m3u8Text && !m3u8Text.includes(AdSignifier)) {
                             return {
                                 PlayerType: playerType,
@@ -742,6 +775,7 @@
                 }
             } catch (err) {
                 console.warn(`[VAFT] Сбой загрузки резервного потока (${playerType}):`, err);
+                streamInfo.FailedPlayerTypes[playerType] = Date.now();
             }
         }
         return {
@@ -852,7 +886,13 @@
             candidatePlayerTypes.unshift(streamInfo.ActiveBackupPlayerType);
         }
 
+        const adProcessingStart = Date.now();
         for (let i = 0; i < candidatePlayerTypes.length; i++) {
+            // Общий лимит времени: плеер ждёт плейлист ~10 c, укладываемся в 6 c
+            if (i > 0 && Date.now() - adProcessingStart > 6000) {
+                console.warn('[VAFT] Лимит времени на поиск резервного потока исчерпан, использую запасной вариант');
+                break;
+            }
             const playerType = candidatePlayerTypes[i];
             const result = await getStreamForResolution(
                 streamInfo,
@@ -931,7 +971,7 @@
                         headers: headers
                     }).then(resolve).catch(reject);
                 }
-            }, 4000);
+            }, 3000);
 
             self.PendingFetchRequests.set(requestId, {
                 resolve: (res) => {
