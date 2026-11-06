@@ -3,7 +3,7 @@ Due to unknown issues with the fork process, it was made as a separate with cred
 
 
 TwitchAdSolutions
-Crecits go to pixeltris, ryanbr, multiple other contributors to TwitchAdSolutions and  CommanderRoo for creating and maintaining the twitch adblock & quality userscripts.
+Credits go to pixeltris, ryanbr, multiple other contributors to TwitchAdSolutions and  CommanderRoo for creating and maintaining the twitch adblock & quality userscripts.
 Updated the script to adress some issues where the web player was breaking and the stream had to be reloaded.
 Integrated a script based on CommanderRoot's script to maintain highest stream quality even when the tab is not active.
 
