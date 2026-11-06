@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         TwitchAdSolutions - VAFT + Auto Best Quality 
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
-// @version      69.3.4
-// @description  Блокирует видеорекламу Twitch (VAFT) без поломки веб-плеера и удерживает наилучшее качество видео 
-// @author       pixeltris / ryanbr / CommanderRoot (fixed)
+// @version      69.3.5
+// @description  Блокирует видеорекламу Twitch (VAFT) без поломки веб-плеера, удерживает наилучшее качество 
+// @author       DrV1rus
 // @match        *://*.twitch.tv/*
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
@@ -35,7 +35,7 @@
         scope.PlayerReloadMinimalRequestsTime = 1500;
         scope.PlayerReloadLowResTime = 1500;
 
-        // Защита от зависаний буфера (без «снежного кома» из частых пауз/перезапусков)
+        // Защита от зависаний буфера во время рекламы
         scope.PlayerBufferingFix = true;
         scope.FixPlayerBufferingInsideAds = true;
         scope.FixPlayerBufferingOutsideAds = false;
@@ -46,14 +46,12 @@
         scope.DelayBetweenEachPlayerFixBufferAttempt = 15000;
         scope.PlayerBufferingCheckPosition = true;
 
-        // Настройки удержания максимального качества в фоне
+        // Пассивное удержание максимального качества в фоне (без принудительного дерганья player.setQuality)
         scope.DisableBackgroundDownscale = true;
         scope.ForceBestVideoQuality = true;
-        // 'MaxAvailable' = Source (chunked). Можно указать, например, '1080p60'
-        scope.PreferredMaxQuality = 'MaxAvailable';
-        // Минимальный интервал между принудительными переключениями качества (мс).
-        // Частый setQuality() заставляет плеер перезапрашивать плейлисты/сегменты -> ошибка #2000.
-        scope.QualityApplyCooldown = 15000;
+
+        // Автоматический мягкий перезапуск плеера, если из-за обрыва CDN всё же выскочила ошибка #2000/#3000
+        scope.AutoRecoverOnError2000 = true;
 
         scope.StreamInfos = [];
         scope.StreamInfosByUrl = [];
@@ -72,10 +70,11 @@
 
     // =========================================================================
     // БЛОК 1: Запрет сброса качества в неактивной вкладке и авто-выбор Source
+    // (Строго по методу CommanderRoot #383093 — без вызовов setQuality() на живом плеере,
+    // которые через ~1 час вызывали сброс буфера и ошибку #2000)
     // =========================================================================
 
     let userManuallyPaused = false;
-    let lastQualityApplyTime = 0;
 
     function isAdBannerShown() {
         return pageDoc.getElementById('vaft-adblock-banner')?.style.display === 'block';
@@ -86,79 +85,11 @@
         try {
             pageWindow.localStorage.setItem('s-qs-ts', String(Math.floor(Date.now())));
             pageWindow.localStorage.setItem('quality-bitrate', '9840720');
-            // 'chunked' — внутренний идентификатор Source в плеере Twitch
+            // 'chunked' — внутренний идентификатор Source (наилучшего качества) в плеере Twitch
             pageWindow.localStorage.setItem('video-quality', '{"default":"chunked"}');
         } catch (e) {
             console.warn('[VAFT+Quality] Не удалось записать настройки качества в localStorage:', e);
         }
-    }
-
-    function applyBestQualityOnPlayerInstance() {
-        if (!pageWindow.ForceBestVideoQuality) return;
-        // Не трогаем качество посреди рекламного блока (иначе собьём резервный поток)
-        if (isAdBannerShown()) return;
-        try {
-            const reactRoot = findReactRootNode();
-            if (!reactRoot) return;
-
-            const playerNode = findReactNode(reactRoot, node =>
-                node.setPlayerActive && node.props && node.props.mediaPlayerInstance
-            );
-            const player = playerNode?.props?.mediaPlayerInstance;
-            if (!player || typeof player.getQualities !== 'function' || typeof player.setQuality !== 'function') {
-                return;
-            }
-            if (typeof player.isPaused === 'function' && player.isPaused()) return;
-
-            const qualities = player.getQualities();
-            if (!Array.isArray(qualities) || qualities.length === 0) {
-                return;
-            }
-
-            let targetQuality = qualities[0];
-            if (pageWindow.PreferredMaxQuality && pageWindow.PreferredMaxQuality !== 'MaxAvailable') {
-                const preferred = qualities.find(q =>
-                    q.group === pageWindow.PreferredMaxQuality ||
-                    (q.name && q.name.includes(pageWindow.PreferredMaxQuality))
-                );
-                if (preferred) {
-                    targetQuality = preferred;
-                }
-            } else {
-                const chunked = qualities.find(q => q.group === 'chunked');
-                if (chunked) {
-                    targetQuality = chunked;
-                }
-            }
-
-            if (!targetQuality || !targetQuality.group) return;
-
-            const currentQuality = typeof player.getQuality === 'function' ? player.getQuality() : null;
-            const isAuto = typeof player.isAutoQualityMode === 'function' ? player.isAutoQualityMode() : false;
-            const groupMismatch = !currentQuality || currentQuality.group !== targetQuality.group;
-            if (!groupMismatch) {
-                // Качество уже верное: только выключаем авто-режим, без смены потока
-                if (isAuto && typeof player.setAutoQualityMode === 'function') {
-                    try {
-                        player.setAutoQualityMode(false);
-                    } catch (e) {}
-                }
-                return;
-            }
-
-            // Анти-«дребезг»: не переключаем качество чаще, чем раз в QualityApplyCooldown
-            const now = Date.now();
-            if (now - lastQualityApplyTime < (pageWindow.QualityApplyCooldown || 15000)) return;
-            lastQualityApplyTime = now;
-
-            if (typeof player.setAutoQualityMode === 'function') {
-                try {
-                    player.setAutoQualityMode(false);
-                } catch (e) {}
-            }
-            player.setQuality(targetQuality);
-            setQualitySettingsInStorage();
-        } catch (e) {}
     }
 
     function setupAntiDownscaleAndVisibilityOverride() {
@@ -251,10 +182,9 @@
                     lastVideoPlaying = false;
                 }
                 setQualitySettingsInStorage();
-                setTimeout(applyBestQualityOnPlayerInstance, 250);
             } else {
                 playVideoIfNeeded();
-                setTimeout(applyBestQualityOnPlayerInstance, 250);
+                setQualitySettingsInStorage();
             }
         }, true);
 
@@ -262,44 +192,33 @@
             e.stopImmediatePropagation();
         }, true);
 
-        // SPA-навигация между каналами/клипами
+        // Обновляем настройку качества в localStorage при переключении каналов/клипов
         pageWindow.addEventListener('popstate', () => {
             userManuallyPaused = false;
             setQualitySettingsInStorage();
-            setTimeout(applyBestQualityOnPlayerInstance, 800);
         });
 
         const pageHistory = pageWindow.history;
         const origPushState = pageHistory.pushState;
         if (origPushState) {
             pageHistory.pushState = function () {
-                const ret = origPushState.apply(this, arguments);
                 userManuallyPaused = false;
                 setQualitySettingsInStorage();
-                setTimeout(applyBestQualityOnPlayerInstance, 800);
-                return ret;
+                return origPushState.apply(this, arguments);
             };
         }
 
         const origReplaceState = pageHistory.replaceState;
         if (origReplaceState) {
             pageHistory.replaceState = function () {
-                const ret = origReplaceState.apply(this, arguments);
                 setQualitySettingsInStorage();
-                setTimeout(applyBestQualityOnPlayerInstance, 800);
-                return ret;
+                return origReplaceState.apply(this, arguments);
             };
         }
-
-        // Периодический контроль качества (с анти-дребезгом внутри applyBestQualityOnPlayerInstance)
-        setInterval(() => {
-            if (!pageWindow.ForceBestVideoQuality) return;
-            applyBestQualityOnPlayerInstance();
-        }, 5000);
     }
 
     // =========================================================================
-    // БЛОК 2: Блокировка рекламы VAFT (Player-Safe Edition)
+    // БЛОК 2: Блокировка рекламы VAFT (Long-Session Stable Edition)
     // =========================================================================
 
     const twitchWorkers = [];
@@ -393,14 +312,22 @@
         return true;
     }
 
+    function syncHeadersToWorker(worker) {
+        try {
+            if (pageWindow.GQLDeviceID) worker.postMessage({ key: 'UpdateDeviceId', value: pageWindow.GQLDeviceID });
+            if (pageWindow.ClientVersion) worker.postMessage({ key: 'UpdateClientVersion', value: pageWindow.ClientVersion });
+            if (pageWindow.ClientSession) worker.postMessage({ key: 'UpdateClientSession', value: pageWindow.ClientSession });
+            if (pageWindow.ClientIntegrityHeader) worker.postMessage({ key: 'UpdateClientIntegrityHeader', value: pageWindow.ClientIntegrityHeader });
+            if (pageWindow.AuthorizationHeader) worker.postMessage({ key: 'UpdateAuthorizationHeader', value: pageWindow.AuthorizationHeader });
+        } catch (e) {}
+    }
+
     function hookWindowWorker() {
         const reinsert = getWorkersForReinsert(pageWindow.Worker);
         const cleanWorker = getCleanWorker(pageWindow.Worker);
 
         const newWorker = class Worker extends cleanWorker {
             constructor(twitchBlobUrl, options) {
-                // Хукаем ТОЛЬКО blob-воркеры самого twitch.tv (и не module-воркеры),
-                // иначе можно сломать посторонние воркеры страницы.
                 let blobUrlStr = '';
                 let isTwitchWorker = false;
                 try {
@@ -480,6 +407,8 @@
 
                 super(URL.createObjectURL(new Blob([newBlobStr], { type: 'text/javascript' })), options);
                 twitchWorkers.push(this);
+                // Сразу передаём уже перехваченные заголовки в новый воркер
+                syncHeadersToWorker(this);
 
                 this.addEventListener('message', (e) => {
                     if (!e.data) return;
@@ -487,9 +416,7 @@
                         updateAdBlockBanner(true, e.data.isMidroll);
                     } else if (e.data.key === 'HideAdBlockBanner') {
                         updateAdBlockBanner(false, false);
-                        // После рекламы возвращаем максимальное качество
                         setQualitySettingsInStorage();
-                        setTimeout(applyBestQualityOnPlayerInstance, 1500);
                     } else if (e.data.key === 'PauseResumePlayer') {
                         doTwitchPlayerTask(true, false);
                     } else if (e.data.key === 'ReloadPlayer') {
@@ -542,7 +469,7 @@
     }
 
     function hookWorkerFetch() {
-        console.log('[VAFT] hookWorkerFetch (vaft player-safe + best-quality active)');
+        console.log('[VAFT] hookWorkerFetch (vaft long-session #2000 fix active)');
         const realFetch = fetch;
         self.PendingFetchRequests = new Map();
         self.FetchRequestId = 0;
@@ -551,15 +478,14 @@
             if (typeof url === 'string') {
                 url = url.trim();
 
-                // ВАЖНО: мастер-плейлист (usher) проверяем ПЕРВЫМ.
-                // Его URL содержит '.m3u8?', поэтому раньше он ошибочно попадал в ветку
-                // медиа-плейлистов, StreamInfos никогда не заполнялись, а UsherParams был пустым.
+                // 1. Мастер-плейлист (usher.ttvnw.net)
                 if (url.includes('/channel/hls/') && !url.includes('picture-by-picture')) {
                     V2API = url.includes('/api/v2/');
-                    const channelName = (new URL(url)).pathname.match(/([^/]+)(?=\.\w+$)/)[0];
-                    CurrentChannelNameFromM3U8 = channelName;
-                    // URL и токен НЕ изменяем: плеер получил токен 'site', и менять
-                    // parent_domains без подмены типа токена нельзя (ломает usher -> #2000).
+                    const channelMatch = (new URL(url)).pathname.match(/([^/]+)(?=\.\w+$)/);
+                    const channelName = channelMatch ? channelMatch[0] : null;
+                    if (channelName) {
+                        CurrentChannelNameFromM3U8 = channelName;
+                    }
                     try {
                         const response = await realFetch(url, options);
                         if (response.status !== 200) {
@@ -567,10 +493,12 @@
                         }
                         const encodingsM3u8 = await response.text();
                         let result = encodingsM3u8;
-                        try {
-                            result = await ublockProcessM3U8(channelName, encodingsM3u8, realFetch, url);
-                        } catch (err) {
-                            console.warn('[VAFT] Ошибка обработки мастер-плейлиста, отдаю исходный:', err);
+                        if (channelName) {
+                            try {
+                                result = await ublockProcessM3U8(channelName, encodingsM3u8, realFetch, url);
+                            } catch (err) {
+                                console.warn('[VAFT] Ошибка разбора мастер-плейлиста, отдаю исходный:', err);
+                            }
                         }
                         return new Response(result, {
                             status: response.status,
@@ -578,18 +506,38 @@
                             headers: response.headers
                         });
                     } catch (err) {
-                        console.warn('[VAFT] Ошибка запроса мастер-плейлиста:', err);
+                        console.warn('[VAFT] Ошибка сети при запросе мастер-плейлиста:', err);
                         return realFetch(url, options);
                     }
                 }
 
+                // 2. Медиа-плейлист (video-weaver.*.hls.ttvnw.net)
                 if (url.endsWith('m3u8') || url.includes('.m3u8?')) {
-                    const response = await realFetch(url, options);
+                    const streamInfo = StreamInfosByUrl[url];
+                    let response = null;
+                    try {
+                        response = await realFetch(url, options);
+                    } catch (fetchErr) {
+                        // При кратковременном обрыве соединения после долгого просмотра делаем быстрый повтор,
+                        // чтобы не ронять плеер в ошибку #2000
+                        try {
+                            response = await realFetch(url, options);
+                        } catch (retryErr) {
+                            if (streamInfo && streamInfo.LastValidM3U8) {
+                                console.warn('[VAFT] Сетевой сбой при опросе M3U8, удерживаю последний валидный плейлист');
+                                return new Response(streamInfo.LastValidM3U8, { status: 200 });
+                            }
+                            throw retryErr;
+                        }
+                    }
+
                     if (response.status !== 200) {
+                        if (streamInfo && streamInfo.LastValidM3U8 && (response.status >= 500 || response.status === 404)) {
+                            return new Response(streamInfo.LastValidM3U8, { status: 200 });
+                        }
                         return response;
                     }
-                    // Читаем тело ОДИН раз и сохраняем: если обработка упадёт, отдаём
-                    // исходный текст. Раньше возвращался уже прочитанный Response -> #2000.
+
                     const text = await response.text();
                     let outText = text;
                     try {
@@ -598,6 +546,11 @@
                         console.warn('[VAFT] Ошибка обработки M3U8, возврат исходного плейлиста:', err);
                         outText = text;
                     }
+
+                    if (streamInfo && outText && outText.includes('#EXTM3U')) {
+                        streamInfo.LastValidM3U8 = outText;
+                    }
+
                     return new Response(outText, {
                         status: response.status,
                         statusText: response.statusText,
@@ -610,11 +563,16 @@
     }
 
     async function ublockProcessM3U8(channelName, encodingsM3u8, realFetch, masterUrl) {
-        // Параметры usher берём из РЕАЛЬНОГО URL мастер-плейлиста (allow_source, p, play_session_id и т.д.).
-        // Раньше они парсились из строки '#EXTM3U' и всегда были пустыми.
         let usherParams = '';
         try {
-            usherParams = (new URL(masterUrl)).search;
+            const parsedUrl = new URL(masterUrl);
+            // Очищаем параметры, привязанные к конкретному токену основного плеера,
+            // чтобы при запросе резервных потоков ('embed', 'autoplay') usher не возвращал 400/403
+            parsedUrl.searchParams.delete('sig');
+            parsedUrl.searchParams.delete('token');
+            parsedUrl.searchParams.delete('parent_domains');
+            parsedUrl.searchParams.delete('referrer');
+            usherParams = parsedUrl.search;
         } catch (e) {}
 
         let streamInfo = StreamInfos[channelName];
@@ -631,7 +589,9 @@
                 ResolutionList: [],
                 BackupEncodingsStatus: new Map(),
                 ActiveBackupPlayerType: null,
-                IsMidroll: false
+                IsMidroll: false,
+                LastValidM3U8: null,
+                FailedPlayerTypes: {}
             };
         } else {
             streamInfo.EncodingsM3U8 = encodingsM3u8;
@@ -667,8 +627,6 @@
         return encodingsM3u8;
     }
 
-    // fetch + чтение тела с жёстким таймаутом. Зависший запрос к резервному потоку
-    // иначе блокирует ответ на запрос плейлиста плеера -> ошибка #2000.
     async function fetchTextWithTimeout(realFetch, url, options, timeoutMs) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -712,17 +670,19 @@
     }
 
     async function getStreamForResolution(streamInfo, resolutionInfo, encodingsM3u8, fallbackStreamStr, playerType, realFetch) {
-        // Если этот тип плеера недавно не сработал — не тратим время на повтор
         streamInfo.FailedPlayerTypes = streamInfo.FailedPlayerTypes || {};
         const failedAt = streamInfo.FailedPlayerTypes[playerType];
-        if (failedAt && Date.now() - failedAt < 10000) {
+        if (failedAt && Date.now() - failedAt < 8000) {
             return { PlayerType: null, M3U8: fallbackStreamStr };
         }
 
-        let playerTypes = streamInfo.EncodingsM3U8Cache[playerType];
-        if (playerTypes) {
-            if (Date.now() - playerTypes.RequestTime <= 15000) {
-                encodingsM3u8 = playerTypes.Value;
+        // ВАЖНО: удерживаем один и тот же резервный мастер-плейлист на протяжении всего рекламного блока (до 5 минут).
+        // В версии 36.4.0 кэш сбрасывался каждые 15 секунд, из-за чего посреди рекламы запрашивался новый
+        // сервер video-weaver с другим #EXT-X-MEDIA-SEQUENCE, что вызывало ошибку #2000 на длинных стримах.
+        let cachedEntry = streamInfo.EncodingsM3U8Cache[playerType];
+        if (cachedEntry) {
+            if (Date.now() - cachedEntry.RequestTime <= 300000) {
+                encodingsM3u8 = cachedEntry.Value;
             } else {
                 streamInfo.EncodingsM3U8Cache[playerType] = null;
             }
@@ -738,8 +698,9 @@
                         const urlInfo = new URL(`https://usher.ttvnw.net/api/${V2API ? 'v2/' : ''}channel/hls/${streamInfo.ChannelName}.m3u8${streamInfo.UsherParams}`);
                         urlInfo.searchParams.set('sig', tokenData.signature);
                         urlInfo.searchParams.set('token', tokenData.value);
-                        const encodingsM3u8Response = await fetchTextWithTimeout(realFetch, urlInfo.href, undefined, 4000);
-                        if (encodingsM3u8Response.status === 200) {
+                        urlInfo.searchParams.set('p', String(Math.floor(Math.random() * 999999)));
+                        const encodingsM3u8Response = await fetchTextWithTimeout(realFetch, urlInfo.href, undefined, 3500);
+                        if (encodingsM3u8Response.status === 200 && encodingsM3u8Response.text.includes('#EXTM3U')) {
                             encodingsM3u8 = encodingsM3u8Response.text;
                             streamInfo.EncodingsM3U8Cache[playerType] = {
                                 RequestTime: Date.now(),
@@ -760,21 +721,27 @@
             try {
                 const streamUrl = getStreamUrlForResolution(encodingsM3u8, resolutionInfo);
                 if (streamUrl) {
-                    const streamResponse = await fetchTextWithTimeout(realFetch, streamUrl, undefined, 4000);
-                    if (streamResponse.status === 200) {
+                    const streamResponse = await fetchTextWithTimeout(realFetch, streamUrl, undefined, 3500);
+                    if (streamResponse.status === 200 && streamResponse.text) {
                         const m3u8Text = streamResponse.text;
-                        if (m3u8Text && !m3u8Text.includes(AdSignifier)) {
+                        if (!m3u8Text.includes(AdSignifier)) {
                             return {
                                 PlayerType: playerType,
                                 M3U8: m3u8Text
                             };
-                        } else if (m3u8Text) {
-                            fallbackStreamStr = m3u8Text;
                         }
+                        // Если резервный поток тоже начал отдавать рекламу, сбрасываем его кэш,
+                        // но НЕ перезаписываем fallbackStreamStr чужим плейлистом с другим MEDIA-SEQUENCE!
+                        streamInfo.EncodingsM3U8Cache[playerType] = null;
+                    } else {
+                        // Если URL резервного потока устарел (403/404), сбрасываем кэш
+                        streamInfo.EncodingsM3U8Cache[playerType] = null;
+                        streamInfo.FailedPlayerTypes[playerType] = Date.now();
                     }
                 }
             } catch (err) {
                 console.warn(`[VAFT] Сбой загрузки резервного потока (${playerType}):`, err);
+                streamInfo.EncodingsM3U8Cache[playerType] = null;
                 streamInfo.FailedPlayerTypes[playerType] = Date.now();
             }
         }
@@ -805,36 +772,64 @@
         let hasLiveSegments = false;
 
         for (let i = 0; i < lines.length; i++) {
-            if (lines[i].startsWith('#EXTINF') && !lines[i].includes('Amazon') && !lines[i].includes('AD')) {
-                let isAdSegment = false;
-                for (let j = Math.max(0, i - 3); j <= i; j++) {
-                    if (lines[j].includes('stitched-ad') || lines[j].includes('EXT-X-DATERANGE')) {
-                        isAdSegment = true;
-                        break;
-                    }
+            if (lines[i].startsWith('#EXTINF') && !lines[i].includes('Amazon') && !lines[i].includes('stitched-ad')) {
+                hasLiveSegments = true;
+                break;
+            }
+        }
+
+        // Если в плейлисте вообще нет живых сегментов, не вырезаем все сегменты (пустой M3U8 вызывает ошибку #2000)
+        if (!hasLiveSegments) {
+            return m3u8Text;
+        }
+
+        let strippedLeadingSegments = 0;
+        let seenFirstKeptSegment = false;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            // Удаляем метаданные рекламного блока и prefetch-ссылки на рекламные сегменты
+            if (line.includes('EXT-X-DATERANGE') && line.includes(AdSignifier)) {
+                continue;
+            }
+            if (line.startsWith('#EXT-X-TWITCH-PREFETCH:')) {
+                continue;
+            }
+
+            // Удаляем рекламный сегмент вместе с предшествующим #EXT-X-PROGRAM-DATE-TIME,
+            // чтобы в плейлисте не оставалось «висячих» тегов времени, ломающих парсер плеера (Issue #355)
+            if (line.startsWith('#EXTINF') && line.includes('Amazon')) {
+                if (cleanLines.length > 0 && cleanLines[cleanLines.length - 1].startsWith('#EXT-X-PROGRAM-DATE-TIME')) {
+                    cleanLines.pop();
                 }
-                if (!isAdSegment) {
-                    hasLiveSegments = true;
+                if (!seenFirstKeptSegment) {
+                    strippedLeadingSegments++;
+                }
+                i++; // Пропускаем URL рекламного сегмента
+                continue;
+            }
+
+            if (line.startsWith('#EXTINF')) {
+                seenFirstKeptSegment = true;
+            }
+            cleanLines.push(line);
+        }
+
+        // Корректируем #EXT-X-MEDIA-SEQUENCE на число удалённых начальных сегментов,
+        // чтобы плеер не считал оставшиеся живые сегменты уже воспроизведёнными
+        if (strippedLeadingSegments > 0) {
+            for (let i = 0; i < cleanLines.length; i++) {
+                if (cleanLines[i].startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+                    const currentSeq = parseInt(cleanLines[i].split(':')[1], 10);
+                    if (!isNaN(currentSeq)) {
+                        cleanLines[i] = `#EXT-X-MEDIA-SEQUENCE:${currentSeq + strippedLeadingSegments}`;
+                    }
                     break;
                 }
             }
         }
 
-        if (!hasLiveSegments) {
-            return m3u8Text;
-        }
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            if (line.includes('EXT-X-DATERANGE') && line.includes(AdSignifier)) {
-                continue;
-            }
-            if (line.startsWith('#EXTINF') && line.includes('Amazon')) {
-                i++;
-                continue;
-            }
-            cleanLines.push(line);
-        }
         return cleanLines.join('\n');
     }
 
@@ -851,6 +846,10 @@
                 console.log('[VAFT] Рекламный блок завершён, возврат к основному потоку');
                 streamInfo.IsShowingAd = false;
                 streamInfo.ActiveBackupPlayerType = null;
+                // Очищаем кэш резервных потоков после завершения рекламы, чтобы к следующей рекламе (через час)
+                // запрашивались свежие токены, а не протухшие сессии
+                streamInfo.EncodingsM3U8Cache = [];
+                streamInfo.FailedPlayerTypes = {};
                 postMessage({ key: 'HideAdBlockBanner' });
                 if (ReloadPlayerAfterAd) {
                     postMessage({ key: 'ReloadPlayer' });
@@ -867,6 +866,7 @@
         if (!streamInfo.IsShowingAd) {
             console.log(`[VAFT] Обнаружена реклама (${streamInfo.IsMidroll ? 'mid-roll' : 'pre-roll'}), переключение на чистый резервный поток...`);
             streamInfo.IsShowingAd = true;
+            streamInfo.FailedPlayerTypes = {};
             postMessage({
                 key: 'ShowAdBlockBanner',
                 isMidroll: streamInfo.IsMidroll
@@ -878,7 +878,8 @@
 
         const currentResolution = streamInfo.Urls[url];
         const serverTime = getServerTimeFromM3u8(textStr);
-        let fallbackM3u8 = textStr;
+        // fallbackM3u8 всегда остаётся оригинальным плейлистом основного потока (с его родным MEDIA-SEQUENCE)
+        const fallbackM3u8 = textStr;
 
         const candidatePlayerTypes = [...BackupPlayerTypes];
         if (streamInfo.ActiveBackupPlayerType && candidatePlayerTypes.includes(streamInfo.ActiveBackupPlayerType)) {
@@ -888,9 +889,8 @@
 
         const adProcessingStart = Date.now();
         for (let i = 0; i < candidatePlayerTypes.length; i++) {
-            // Общий лимит времени: плеер ждёт плейлист ~10 c, укладываемся в 6 c
-            if (i > 0 && Date.now() - adProcessingStart > 6000) {
-                console.warn('[VAFT] Лимит времени на поиск резервного потока исчерпан, использую запасной вариант');
+            if (i > 0 && Date.now() - adProcessingStart > 5500) {
+                console.warn('[VAFT] Лимит времени на поиск резервного потока исчерпан, использую очистку основного плейлиста');
                 break;
             }
             const playerType = candidatePlayerTypes[i];
@@ -905,9 +905,6 @@
             if (result.PlayerType && result.M3U8) {
                 streamInfo.ActiveBackupPlayerType = result.PlayerType;
                 return replaceServerTimeInM3u8(result.M3U8, serverTime);
-            }
-            if (result.M3U8) {
-                fallbackM3u8 = result.M3U8;
             }
         }
 
@@ -949,16 +946,20 @@
         return true;
     }
 
-    function gqlRequest(body, realFetch) {
+    function gqlRequest(body, realFetch, useAnonymousHeaders) {
         const headers = {
             'Client-ID': ClientID,
             'Content-Type': 'text/plain; charset=UTF-8'
         };
         if (GQLDeviceID) headers['X-Device-Id'] = GQLDeviceID;
-        if (ClientVersion) headers['Client-Version'] = ClientVersion;
-        if (ClientSession) headers['Client-Session-Id'] = ClientSession;
-        if (ClientIntegrityHeader) headers['Client-Integrity'] = ClientIntegrityHeader;
-        if (AuthorizationHeader) headers['Authorization'] = AuthorizationHeader;
+        // Через ~1 час токен Client-Integrity в браузере может устареть.
+        // Если запрос с ним не вернул токен, повторный вызов с useAnonymousHeaders=true проходит без него.
+        if (!useAnonymousHeaders) {
+            if (ClientVersion) headers['Client-Version'] = ClientVersion;
+            if (ClientSession) headers['Client-Session-Id'] = ClientSession;
+            if (ClientIntegrityHeader) headers['Client-Integrity'] = ClientIntegrityHeader;
+            if (AuthorizationHeader) headers['Authorization'] = AuthorizationHeader;
+        }
 
         return new Promise((resolve, reject) => {
             const requestId = ++self.FetchRequestId;
@@ -971,7 +972,7 @@
                         headers: headers
                     }).then(resolve).catch(reject);
                 }
-            }, 3000);
+            }, 2500);
 
             self.PendingFetchRequests.set(requestId, {
                 resolve: (res) => {
@@ -999,7 +1000,7 @@
         });
     }
 
-    function getAccessToken(channelName, playerType, realFetch) {
+    async function getAccessToken(channelName, playerType, realFetch) {
         const body = makeGraphQlPacket('PlaybackAccessToken', '0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712', {
             isLive: true,
             login: channelName,
@@ -1007,7 +1008,17 @@
             vodID: '',
             playerType: playerType
         });
-        return gqlRequest(body, realFetch);
+        try {
+            const res = await gqlRequest(body, realFetch, false);
+            if (res && res.status === 200) {
+                const cloneText = await res.clone().text();
+                if (cloneText.includes('streamPlaybackAccessToken') && !cloneText.includes('"streamPlaybackAccessToken":null')) {
+                    return res;
+                }
+            }
+        } catch (e) {}
+        // Запасной запрос без протухающего через час Client-Integrity
+        return gqlRequest(body, realFetch, true);
     }
 
     function makeGraphQlPacket(operationName, sha256Hash, variables) {
@@ -1073,7 +1084,7 @@
             const player = playerNode?.props?.mediaPlayerInstance;
             if (!player) return;
 
-            if ((player.isPaused && player.isPaused()) || userManuallyPaused) {
+            if (!isReload && ((player.isPaused && player.isPaused()) || userManuallyPaused)) {
                 return;
             }
 
@@ -1152,19 +1163,50 @@
         } catch (e) {}
     }
 
-    function setupBufferingMonitor() {
+    function setupBufferingAndErrorMonitor() {
         let lastBufferingFixTime = 0;
+        let lastErrorRecoverTime = 0;
         let samePositionCount = 0;
         let lastPosition = -1;
 
         setInterval(() => {
+            const now = Date.now();
+
+            // 1. Авто-восстановление при появлении ошибки #2000 / #3000 / #1000 после долгого просмотра
+            if (pageWindow.AutoRecoverOnError2000 && now - lastErrorRecoverTime > 8000) {
+                try {
+                    const errorOverlay = pageDoc.querySelector('[data-a-target="player-overlay-content-gate"], .content-overlay-gate');
+                    const overlayText = errorOverlay ? (errorOverlay.textContent || '') : '';
+                    const hasErrorCodeInDom = /#(1000|2000|3000|4000)/.test(overlayText);
+
+                    const reactRoot = findReactRootNode();
+                    const playerNode = reactRoot ? findReactNode(reactRoot, node =>
+                        node.setPlayerActive && node.props && node.props.mediaPlayerInstance
+                    ) : null;
+                    const player = playerNode?.props?.mediaPlayerInstance;
+                    const hasPlayerStateError = Boolean(player?.core?.state?.error);
+
+                    if (hasErrorCodeInDom || hasPlayerStateError) {
+                        console.warn('[VAFT] Обнаружена ошибка плеера (#2000/#3000), выполняю автоматический мягкий перезапуск плеера...');
+                        lastErrorRecoverTime = now;
+                        const retryBtn = errorOverlay ? errorOverlay.querySelector('button') : null;
+                        if (retryBtn) {
+                            retryBtn.click();
+                        } else {
+                            doTwitchPlayerTask(false, true);
+                        }
+                        return;
+                    }
+                } catch (e) {}
+            }
+
+            // 2. Мониторинг бесконечной буферизации во время рекламы
             if (!pageWindow.PlayerBufferingFix) return;
 
             const isShowingAd = isAdBannerShown();
             if (isShowingAd && !pageWindow.FixPlayerBufferingInsideAds) return;
             if (!isShowingAd && !pageWindow.FixPlayerBufferingOutsideAds) return;
 
-            const now = Date.now();
             if (now - lastBufferingFixTime < pageWindow.DelayBetweenEachPlayerFixBufferAttempt) {
                 return;
             }
@@ -1229,12 +1271,14 @@
                     const clientIntegrity = getHeader('Client-Integrity');
                     const auth = getHeader('Authorization');
 
+                    if (deviceId) pageWindow.GQLDeviceID = deviceId;
+                    if (clientVersion) pageWindow.ClientVersion = clientVersion;
+                    if (clientSession) pageWindow.ClientSession = clientSession;
+                    if (clientIntegrity) pageWindow.ClientIntegrityHeader = clientIntegrity;
+                    if (auth) pageWindow.AuthorizationHeader = auth;
+
                     for (let i = 0; i < twitchWorkers.length; i++) {
-                        if (deviceId) twitchWorkers[i].postMessage({ key: 'UpdateDeviceId', value: deviceId });
-                        if (clientVersion) twitchWorkers[i].postMessage({ key: 'UpdateClientVersion', value: clientVersion });
-                        if (clientSession) twitchWorkers[i].postMessage({ key: 'UpdateClientSession', value: clientSession });
-                        if (clientIntegrity) twitchWorkers[i].postMessage({ key: 'UpdateClientIntegrityHeader', value: clientIntegrity });
-                        if (auth) twitchWorkers[i].postMessage({ key: 'UpdateAuthorizationHeader', value: auth });
+                        syncHeadersToWorker(twitchWorkers[i]);
                     }
                 }
             } catch (e) {}
@@ -1255,9 +1299,9 @@
         hookWindowWorker();
         hookFetchForHeaders();
         if (pageDoc.readyState === 'loading') {
-            pageDoc.addEventListener('DOMContentLoaded', setupBufferingMonitor);
+            pageDoc.addEventListener('DOMContentLoaded', setupBufferingAndErrorMonitor);
         } else {
-            setupBufferingMonitor();
+            setupBufferingAndErrorMonitor();
         }
     }
 })();
