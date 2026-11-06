@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
 // @version      69.3.1
 // @description  Блокирует видеорекламу Twitch (VAFT) без поломки веб-плеера и удерживает наилучшее качество видео (Source)
-// @author       pixeltris / ryanbr / CommanderRoot (fixed)
+// @author       DrV1rus
 // @match        *://*.twitch.tv/*
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
