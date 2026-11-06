@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         TwitchAdSolutions - VAFT + Auto Best Quality (No Background Downscale)
+// @name         TwitchAdSolutions - VAFT + Auto Best Quality
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
 // @version      69.2.0
 // @description  Блокирует видеорекламу Twitch (VAFT) без поломки веб-плеера и удерживает наилучшее качество видео (Source / 1080p60 / 1440p60) даже в неактивной вкладке.
-// @author       pixeltris / ryanbr / CommanderRoot (Updated for 2026 Twitch Player)
+// @author       pixeltris / ryanbr / CommanderRoot (Updated for recent changes)
 // @match        *://*.twitch.tv/*
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
