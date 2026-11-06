@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         TwitchAdSolutions - VAFT (Player-Safe Updated Edition)
-// @namespace    https://github.com/ryanbr/TwitchAdSolutions
+// @namespace    https://github.com/DrV1rus/twitch-adblock-v1
 // @version      36.1.0
 // @description  Блокирует видеорекламу Twitch (VAFT) с защитой веб-плеера от бесконечной буферизации, чёрного экрана и ошибок #2000/#3000.
-// @author       pixeltris / ryanbr (Updated player-safe config)
+// @author       pixeltris / ryanbr (Updated player-safe config) /DrV1rus for partial update
 // @match        *://*.twitch.tv/*
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
