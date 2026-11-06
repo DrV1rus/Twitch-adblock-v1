@@ -12,6 +12,6 @@ How to install:
 
 ## Script installation:
 1. Install extension[Tampermonkey](https://www.tampermonkey.net/) or any other userscript extension.
-2. Click the link to install the userscript: **[Twitch AdSolutions (VAFT v69.3.7)](https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js)**
+2. Click the link to install the userscript: **[userscript](https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js)**
 
 
