@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         TwitchAdSolutions - VAFT (Player-Safe Updated Edition)
+// @name         TwitchAdSolutions - VAFT + Auto Best Quality (No Background Downscale)
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
-// @version      69.1.0
-// @description  Блокирует видеорекламу Twitch (VAFT) с защитой веб-плеера от бесконечной буферизации, чёрного экрана и ошибок #2000/#3000.
-// @author       pixeltris / ryanbr (Updated player-safe config) /DrV1rus for partial update
+// @version      69.2.0
+// @description  Блокирует видеорекламу Twitch (VAFT) без поломки веб-плеера и удерживает наилучшее качество видео (Source / 1080p60 / 1440p60) даже в неактивной вкладке.
+// @author       pixeltris / ryanbr / CommanderRoot (Updated for 2026 Twitch Player)
 // @match        *://*.twitch.tv/*
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
@@ -16,6 +16,7 @@
 
     const ourTwitchAdSolutionsVersion = 36;
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const pageDoc = pageWindow.document;
 
     function declareOptions(scope) {
         scope.AdSignifier = 'stitched';
@@ -46,6 +47,13 @@
         scope.DelayBetweenEachPlayerFixBufferAttempt = 15000;
         scope.PlayerBufferingCheckPosition = true;
 
+        // Настройки удержания максимального качества в фоне (на базе CommanderRoot 383093 + фиксы 2026)
+        scope.DisableBackgroundDownscale = true;
+        scope.ForceBestVideoQuality = true;
+        // 'MaxAvailable' выбирает самое высокое доступное на стриме качество (Source/chunked: 1440p60 или 1080p60);
+        //Если хотите ограничить 1080p60 на 2K/4K стримах в Chromium, можно указать '1080p60'
+        scope.PreferredMaxQuality = 'MaxAvailable';
+
         scope.StreamInfos = [];
         scope.StreamInfosByUrl = [];
         scope.CurrentChannelNameFromM3U8 = null;
@@ -60,6 +68,228 @@
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
     }
+
+    // =========================================================================
+    // БЛОК 1: Запрет сброса качества в неактивной вкладке и авто-выбор Source
+    // (Обновлённая версия скрипта CommanderRoot #383093 под плеер Twitch 2026)
+    // =========================================================================
+
+    let userManuallyPaused = false;
+
+    function setQualitySettingsInStorage() {
+        if (!pageWindow.ForceBestVideoQuality) return;
+        try {
+            pageWindow.localStorage.setItem('s-qs-ts', String(Math.floor(Date.now())));
+            pageWindow.localStorage.setItem('quality-bitrate', '9840720');
+            // 'chunked' — внутренний идентификатор Source (исходного наилучшего качества) в плеере Twitch
+            pageWindow.localStorage.setItem('video-quality', '{"default":"chunked"}');
+        } catch (e) {
+            console.warn('[VAFT+Quality] Не удалось записать настройки качества в localStorage:', e);
+        }
+    }
+
+    function applyBestQualityOnPlayerInstance() {
+        if (!pageWindow.ForceBestVideoQuality) return;
+        try {
+            const reactRoot = findReactRootNode();
+            if (!reactRoot) return;
+
+            const playerNode = findReactNode(reactRoot, node =>
+                node.setPlayerActive && node.props && node.props.mediaPlayerInstance
+            );
+            const player = playerNode?.props?.mediaPlayerInstance;
+            if (!player || typeof player.getQualities !== 'function' || typeof player.setQuality !== 'function') {
+                return;
+            }
+
+            const qualities = player.getQualities();
+            if (! Array.isArray(qualities) || qualities.length === 0) {
+                return;
+            }
+
+            // Ищем целевое качество: либо указанное в PreferredMaxQuality, либо самое первое (Source / chunked / максимальный битрейт)
+            let targetQuality = qualities[0];
+            if (pageWindow.PreferredMaxQuality && pageWindow.PreferredMaxQuality !== 'MaxAvailable') {
+                const preferred = qualities.find(q =>
+                    q.group === pageWindow.PreferredMaxQuality ||
+                    (q.name && q.name.includes(pageWindow.PreferredMaxQuality))
+                );
+                if (preferred) {
+                    targetQuality = preferred;
+                }
+            } else {
+                const chunked = qualities.find(q => q.group === 'chunked');
+                if (chunked) {
+                    targetQuality = chunked;
+                }
+            }
+
+            if (!targetQuality || !targetQuality.group) return;
+
+            const currentQuality = typeof player.getQuality === 'function' ? player.getQuality() : null;
+            const isAuto = typeof player.isAutoQualityMode === 'function' ? player.isAutoQualityMode() : false;
+
+            if (isAuto || !currentQuality || currentQuality.group !== targetQuality.group) {
+                if (typeof player.setAutoQualityMode === 'function') {
+                    try {
+                        player.setAutoQualityMode(false);
+                    } catch (e) {}
+                }
+                player.setQuality(targetQuality);
+                setQualitySettingsInStorage();
+            }
+        } catch (e) {}
+    }
+
+    function setupAntiDownscaleAndVisibilityOverride() {
+        setQualitySettingsInStorage();
+
+        // Сохраняем нативный геттер document.hidden до переопределения,
+        // чтобы скрипт знал реальное состояние вкладки, а Twitch всегда видел hidden = false
+        const docProto = Object.getPrototypeOf(pageDoc) || Document.prototype;
+        const nativeHiddenDescriptor =
+            Object.getOwnPropertyDescriptor(docProto, 'hidden') ||
+            Object.getOwnPropertyDescriptor(Document.prototype, 'hidden') ||
+            Object.getOwnPropertyDescriptor(pageDoc, 'hidden');
+
+        const isTabActuallyHidden = () => {
+            try {
+                if (nativeHiddenDescriptor && typeof nativeHiddenDescriptor.get === 'function') {
+                    return Boolean(nativeHiddenDescriptor.get.call(pageDoc));
+                }
+            } catch (e) {}
+            return false;
+        };
+
+        const initialHidden = isTabActuallyHidden();
+        let didInitialPlay = false;
+        let lastVideoPlaying = false;
+
+        try {
+            // Переопределяем свойства видимости (включая document.hidden, которого не хватало в старом скрипте 383093)
+            const visibilityProps = {
+                visibilityState: { get: () => 'visible', configurable: true },
+                webkitVisibilityState: { get: () => 'visible', configurable: true },
+                hidden: { get: () => false, configurable: true },
+                webkitHidden: { get: () => false, configurable: true },
+                mozHidden: { get: () => false, configurable: true }
+            };
+
+            for (const [prop, desc] of Object.entries(visibilityProps)) {
+                try {
+                    Object.defineProperty(pageDoc, prop, desc);
+                } catch (e) {}
+                try {
+                    Object.defineProperty(Document.prototype, prop, desc);
+                } catch (e) {}
+            }
+
+            pageDoc.hasFocus = function () {
+                return true;
+            };
+        } catch (e) {
+            console.warn('[VAFT+Quality] Ошибка переопределения Page Visibility API:', e);
+        }
+
+        // Отслеживаем ручную паузу пользователем, чтобы не снимать с паузы VOD или стримы, остановленные вручную
+        pageDoc.addEventListener('click', (e) => {
+            const btn = e.target && e.target.closest ? e.target.closest('[data-a-target="player-play-pause-button"]') : null;
+            if (btn) {
+                const videos = pageDoc.getElementsByTagName('video');
+                if (videos.length > 0) {
+                    // Если до клика видео играло, значит пользователь ставит его на паузу вручную
+                    userManuallyPaused = !videos[0].paused;
+                }
+            }
+        }, true);
+
+        function playVideoIfNeeded() {
+            if (userManuallyPaused) return;
+            const videos = pageDoc.getElementsByTagName('video');
+            if (videos.length > 0) {
+                if ((didInitialPlay === false || lastVideoPlaying === true) && !videos[0].ended) {
+                    videos[0].play().catch(() => {});
+                    didInitialPlay = true;
+                }
+            }
+        }
+
+        // Блокируем события visibilitychange, blur и webkitvisibilitychange, по которым Twitch снижает качество до 480p/720p
+        pageDoc.addEventListener('visibilitychange', function (e) {
+            const currentlyHidden = isTabActuallyHidden();
+            if (currentlyHidden === false && initialHidden === true && didInitialPlay === false) {
+                // Разрешаем однократное прохождение события при открытии стрима в фоновой вкладке, чтобы не было чёрного экрана
+            } else {
+                e.stopImmediatePropagation();
+            }
+
+            if (currentlyHidden) {
+                didInitialPlay = true;
+            }
+
+            if (currentlyHidden === true) {
+                const videos = pageDoc.getElementsByTagName('video');
+                if (videos.length > 0) {
+                    lastVideoPlaying = !videos[0].paused && !videos[0].ended && !userManuallyPaused;
+                } else {
+                    lastVideoPlaying = false;
+                }
+                // При уходе со вкладки сразу фиксируем максимальное качество
+                setQualitySettingsInStorage();
+                setTimeout(applyBestQualityOnPlayerInstance, 250);
+            } else {
+                playVideoIfNeeded();
+                setTimeout(applyBestQualityOnPlayerInstance, 250);
+            }
+        }, true);
+
+        pageDoc.addEventListener('webkitvisibilitychange', function (e) {
+            e.stopImmediatePropagation();
+        }, true);
+
+        // Перехватываем SPA-навигацию между каналами/клипами (popstate + History API)
+        pageWindow.addEventListener('popstate', () => {
+            userManuallyPaused = false;
+            setQualitySettingsInStorage();
+            setTimeout(applyBestQualityOnPlayerInstance, 800);
+        });
+
+        const origPushState = history.pushState;
+        if (origPushState) {
+            history.pushState = function () {
+                const ret = origPushState.apply(this, arguments);
+                userManuallyPaused = false;
+                setQualitySettingsInStorage();
+                setTimeout(applyBestQualityOnPlayerInstance, 800);
+                return ret;
+            };
+        }
+
+        const origReplaceState = history.replaceState;
+        if (origReplaceState) {
+            history.replaceState = function () {
+                const ret = origReplaceState.apply(this, arguments);
+                setQualitySettingsInStorage();
+                setTimeout(applyBestQualityOnPlayerInstance, 800);
+                return ret;
+            };
+        }
+
+        // Периодический контроль качества: удерживает Source даже в фоне и восстанавливает качество после рекламного блока
+        setInterval(() => {
+            if (!pageWindow.ForceBestVideoQuality) return;
+            const isShowingAd = pageDoc.getElementById('vaft-adblock-banner')?.style.display === 'block';
+            // Не переключаем качество прямо посреди блокировки рекламы, чтобы не сбить резервный поток,
+            // но сразу удерживаем максимум в остальное время
+            if (!isShowingAd) {
+                applyBestQualityOnPlayerInstance();
+            }
+        }, 4000);
+    }
+
+    // =========================================================================
+    // БЛОК 2: Блокировка рекламы VAFT (Player-Safe Edition)
+    // =========================================================================
 
     const twitchWorkers = [];
     const workerStringConflicts = [
@@ -237,6 +467,10 @@
                         updateAdBlockBanner(true, e.data.isMidroll);
                     } else if (e.data.key === 'HideAdBlockBanner') {
                         updateAdBlockBanner(false, false);
+                        // После завершения рекламы сразу возвращаем максимальное качество (фикс проблемы даунскейла после рекламы)
+                        setQualitySettingsInStorage();
+                        setTimeout(applyBestQualityOnPlayerInstance, 500);
+                        setTimeout(applyBestQualityOnPlayerInstance, 2000);
                     } else if (e.data.key === 'PauseResumePlayer') {
                         doTwitchPlayerTask(true, false);
                     } else if (e.data.key === 'ReloadPlayer') {
@@ -289,7 +523,7 @@
     }
 
     function hookWorkerFetch() {
-        console.log('[VAFT] hookWorkerFetch (vaft player-safe active)');
+        console.log('[VAFT] hookWorkerFetch (vaft player-safe + best-quality active)');
         const realFetch = fetch;
         self.PendingFetchRequests = new Map();
         self.FetchRequestId = 0;
@@ -514,7 +748,6 @@
         const cleanLines = [];
         let hasLiveSegments = false;
 
-        // Проверяем, есть ли хотя бы один живой (не рекламный) сегмент в плейлисте
         for (let i = 0; i < lines.length; i++) {
             if (lines[i].startsWith('#EXTINF') && !lines[i].includes('Amazon') && !lines[i].includes('AD')) {
                 let isAdSegment = false;
@@ -531,8 +764,6 @@
             }
         }
 
-        // Если в плейлисте есть чистые сегменты, аккуратно вырезаем рекламные;
-        // если ВСЕ сегменты рекламные, не удаляем всё целиком (чтобы HLS-плеер не завис с пустым плейлистом)
         if (!hasLiveSegments) {
             return m3u8Text;
         }
@@ -543,7 +774,7 @@
                 continue;
             }
             if (line.startsWith('#EXTINF') && line.includes('Amazon')) {
-                i++; // Пропускаем URL рекламного сегмента
+                i++;
                 continue;
             }
             cleanLines.push(line);
@@ -561,14 +792,13 @@
 
         if (!haveAdTags) {
             if (streamInfo.IsShowingAd) {
-                console.log('[VAFT] Рекламный блок завершён, возврат к основному потоку');
+                console.log('[VAFT] Рекламный блок завершён, возврат к основному потоку и восстановление максимального качества');
                 streamInfo.IsShowingAd = false;
                 streamInfo.ActiveBackupPlayerType = null;
                 postMessage({ key: 'HideAdBlockBanner' });
                 if (ReloadPlayerAfterAd) {
                     postMessage({ key: 'ReloadPlayer' });
                 } else {
-                    // Мягкая синхронизация буфера через 1 секунду после окончания рекламы без перезагрузки плеера
                     setTimeout(() => {
                         postMessage({ key: 'PauseResumePlayer' });
                     }, 1000);
@@ -594,7 +824,6 @@
         const serverTime = getServerTimeFromM3u8(textStr);
         let fallbackM3u8 = textStr;
 
-        // Сначала проверяем уже найденный рабочий резервный тип плеера
         const candidatePlayerTypes = [...BackupPlayerTypes];
         if (streamInfo.ActiveBackupPlayerType && candidatePlayerTypes.includes(streamInfo.ActiveBackupPlayerType)) {
             candidatePlayerTypes.splice(candidatePlayerTypes.indexOf(streamInfo.ActiveBackupPlayerType), 1);
@@ -620,8 +849,6 @@
             }
         }
 
-        // Если ни один резервный тип плеера не вернул полностью чистый плейлист,
-        // аккуратно очищаем плейлист от рекламных сегментов с сохранением SERVER-TIME
         if (IsAdStrippingEnabled && fallbackM3u8) {
             return replaceServerTimeInM3u8(getAdSegmentCleanM3u8(fallbackM3u8), serverTime);
         }
@@ -752,7 +979,7 @@
 
     function findReactRootNode() {
         let reactRootNode = null;
-        const rootNode = document.querySelector('#root');
+        const rootNode = pageDoc.querySelector('#root');
         if (rootNode) {
             const reactKey = Object.keys(rootNode).find(k => k.startsWith('__reactContainer') || k.startsWith('_reactRootContainer'));
             if (reactKey) {
@@ -769,7 +996,6 @@
 
     function doTwitchPlayerTask(isPausePlay, isReload) {
         const now = Date.now();
-        // Защита от двойного вызова (Issue #492): не выполняем повторный таск чаще чем раз в 2.5 секунды
         if (now - lastPlayerTaskTime < 2500) {
             return;
         }
@@ -785,8 +1011,7 @@
             const player = playerNode?.props?.mediaPlayerInstance;
             if (!player) return;
 
-            // Не вмешиваемся, если пользователь сам поставил плеер на паузу
-            if (player.isPaused && player.isPaused()) {
+            if ((player.isPaused && player.isPaused()) || userManuallyPaused) {
                 return;
             }
 
@@ -795,6 +1020,7 @@
                 setTimeout(() => {
                     try {
                         player.play();
+                        setTimeout(applyBestQualityOnPlayerInstance, 300);
                     } catch (e) {}
                 }, 50);
                 return;
@@ -804,26 +1030,24 @@
                 const lsKeyQuality = 'video-quality';
                 const lsKeyMuted = 'video-muted';
                 const lsKeyVolume = 'volume';
-                const currentQuality = localStorage.getItem(lsKeyQuality);
-                const currentMuted = localStorage.getItem(lsKeyMuted);
-                const currentVolume = localStorage.getItem(lsKeyVolume);
+                const currentMuted = pageWindow.localStorage.getItem(lsKeyMuted);
+                const currentVolume = pageWindow.localStorage.getItem(lsKeyVolume);
 
                 if (player?.core?.state) {
-                    localStorage.setItem(lsKeyMuted, JSON.stringify({ default: player.core.state.muted }));
-                    localStorage.setItem(lsKeyVolume, player.core.state.volume);
+                    pageWindow.localStorage.setItem(lsKeyMuted, JSON.stringify({ default: player.core.state.muted }));
+                    pageWindow.localStorage.setItem(lsKeyVolume, player.core.state.volume);
                 }
-                if (player?.core?.state?.quality?.group) {
-                    localStorage.setItem(lsKeyQuality, JSON.stringify({ default: player.core.state.quality.group }));
-                }
+                // Всегда сохраняем Source ('chunked') при перезагрузке плеера
+                pageWindow.localStorage.setItem(lsKeyQuality, '{"default":"chunked"}');
 
                 playerNode.setPlayerActive(false);
                 setTimeout(() => {
                     try {
                         playerNode.setPlayerActive(true);
+                        setTimeout(applyBestQualityOnPlayerInstance, 500);
                     } finally {
-                        if (currentQuality !== null) localStorage.setItem(lsKeyQuality, currentQuality);
-                        if (currentMuted !== null) localStorage.setItem(lsKeyMuted, currentMuted);
-                        if (currentVolume !== null) localStorage.setItem(lsKeyVolume, currentVolume);
+                        if (currentMuted !== null) pageWindow.localStorage.setItem(lsKeyMuted, currentMuted);
+                        if (currentVolume !== null) pageWindow.localStorage.setItem(lsKeyVolume, currentVolume);
                     }
                 }, 150);
             }
@@ -834,7 +1058,7 @@
 
     function updateAdBlockBanner(show, isMidroll) {
         try {
-            let banner = document.getElementById('vaft-adblock-banner');
+            let banner = pageDoc.getElementById('vaft-adblock-banner');
             if (!show) {
                 if (banner) {
                     banner.style.display = 'none';
@@ -842,9 +1066,9 @@
                 return;
             }
             if (!banner) {
-                const playerContainer = document.querySelector('.video-player__overlay, [data-a-target="video-player"]');
+                const playerContainer = pageDoc.querySelector('.video-player__overlay, [data-a-target="video-player"]');
                 if (!playerContainer) return;
-                banner = document.createElement('div');
+                banner = pageDoc.createElement('div');
                 banner.id = 'vaft-adblock-banner';
                 banner.style.cssText = [
                     'position: absolute',
@@ -877,7 +1101,7 @@
         setInterval(() => {
             if (!pageWindow.PlayerBufferingFix) return;
 
-            const isShowingAd = document.getElementById('vaft-adblock-banner')?.style.display === 'block';
+            const isShowingAd = pageDoc.getElementById('vaft-adblock-banner')?.style.display === 'block';
             if (isShowingAd && !pageWindow.FixPlayerBufferingInsideAds) return;
             if (!isShowingAd && !pageWindow.FixPlayerBufferingOutsideAds) return;
 
@@ -893,7 +1117,7 @@
                     node.setPlayerActive && node.props && node.props.mediaPlayerInstance
                 );
                 const player = playerNode?.props?.mediaPlayerInstance;
-                if (!player || (player.isPaused && player.isPaused())) {
+                if (!player || (player.isPaused && player.isPaused()) || userManuallyPaused) {
                     samePositionCount = 0;
                     return;
                 }
@@ -906,7 +1130,7 @@
 
                 const isBuffering = Boolean(
                     player?.core?.state?.buffering ||
-                    document.querySelector('.tw-loading-spinner')
+                    pageDoc.querySelector('.tw-loading-spinner')
                 );
 
                 if (isBuffering && position !== null && Math.abs(position - lastPosition) < 0.05) {
@@ -959,15 +1183,20 @@
         };
     }
 
+    declareOptions(pageWindow);
+
+    if (pageWindow.DisableBackgroundDownscale) {
+        setupAntiDownscaleAndVisibilityOverride();
+    }
+
     if (isWorkerDoubleHooked(null, 'twitch')) {
-        console.warn('[VAFT] Обнаружен другой блокировщик рекламы Twitch (Worker уже перехвачен). Пропуск запуска во избежание поломки плеера.');
+        console.warn('[VAFT] Обнаружен другой блокировщик рекламы Twitch (Worker уже перехвачен). Пропуск запуска Worker-хука во избежание поломки плеера.');
     } else {
-        declareOptions(pageWindow);
         pageWindow.reloadTwitchPlayer = doTwitchPlayerTask;
         hookWindowWorker();
         hookFetchForHeaders();
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', setupBufferingMonitor);
+        if (pageDoc.readyState === 'loading') {
+            pageDoc.addEventListener('DOMContentLoaded', setupBufferingMonitor);
         } else {
             setupBufferingMonitor();
         }
