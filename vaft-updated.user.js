@@ -1,11 +1,11 @@
 // ==UserScript==
-// @name         TwitchAdSolutions (VAFT) + Auto Best Quality
+// @name         TwitchAdSolutions - VAFT + Auto Best Quality (No Background Downscale)
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
-// @version      69.3.7
-// @description  Twitch AdSolutions (vaft) + Auto High Quality
+// @version      69.3.8
+// @description  TwitchAdSolutions + Best Quality default
 // @updateURL    https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
 // @downloadURL  https://raw.githubusercontent.com/DrV1rus/twitch-adblock-v1/main/vaft-updated.user.js
-// @author       https://github.com/cleanlock/VideoAdBlockForTwitch#credits
+// @author       pixeltris / ryanbr / xBandaku / CommanderRoot
 // @match        *://*.twitch.tv/*
 // @run-at       document-start
 // @inject-into  page
@@ -50,7 +50,7 @@
     'use strict';
     const ourTwitchAdSolutionsVersion = 124;// Used to prevent conflicts with outdated versions of the scripts
     const TAS_INSTALL_METHOD = 'userscript';
-    console.log('[AD DEBUG] TwitchAdSolutions vaft v' + ourTwitchAdSolutionsVersion + ' (69.3.7 + BestQuality) loading');
+    console.log('[AD DEBUG] TwitchAdSolutions vaft v' + ourTwitchAdSolutionsVersion + ' (69.3.8 + BestQuality) loading');
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log('[AD DEBUG] CONFLICT: vaft v' + ourTwitchAdSolutionsVersion + ' skipped — another script already active (v' + window.twitchAdSolutionsVersion + '). Remove duplicate scripts.');
         return;
@@ -424,14 +424,14 @@
         return !hasConflict || hasReinsert;
     }
     // Replace window.Worker to intercept Twitch's video worker and inject ad-blocking logic
-    let injectedBlobUrl = null;
+    const injectedBlobUrls = new Set();
     let originalRevokeObjectURL = null;
     function hookWindowWorker() {
-        // Prevent Twitch from revoking our injected worker blob URL
+        // Prevent Twitch from revoking our injected worker blob URLs
         if (!URL.revokeObjectURL.__tasMasked) {
             originalRevokeObjectURL = URL.revokeObjectURL;
             URL.revokeObjectURL = maskAsNative(function(url) {
-                if (url === injectedBlobUrl) return;
+                if (injectedBlobUrls.has(url)) return;
                 return originalRevokeObjectURL.call(this, url);
             }, 'revokeObjectURL');
             URL.revokeObjectURL.__tasMasked = true;
@@ -587,15 +587,24 @@
                     console.log('[AD DEBUG] Worker already hooked — reusing without re-injection');
                 } else {
                     console.log('[AD DEBUG] Worker intercepted — injecting ad-block hooks');
-                    // Revoke previous blob URL to prevent memory accumulation across worker replacements
-                    if (injectedBlobUrl && originalRevokeObjectURL) {
-                        try { originalRevokeObjectURL.call(URL, injectedBlobUrl); } catch {}
-                    }
-                    injectedBlobUrl = URL.createObjectURL(new Blob([newBlobStr]));
-                    super(injectedBlobUrl, options);
+                    const blobUrl = URL.createObjectURL(new Blob([newBlobStr]));
+                    injectedBlobUrls.add(blobUrl);
+                    super(blobUrl, options);
                 }
-                twitchWorkers.length = 0;
-                twitchWorkers.push(this);
+                if (!twitchWorkers.includes(this)) {
+                    twitchWorkers.push(this);
+                    if (twitchWorkers.length > 4) {
+                        twitchWorkers.shift();
+                    }
+                }
+                const realTerminate = this.terminate;
+                if (typeof realTerminate === 'function') {
+                    this.terminate = function() {
+                        const idx = twitchWorkers.indexOf(this);
+                        if (idx !== -1) twitchWorkers.splice(idx, 1);
+                        return realTerminate.apply(this, arguments);
+                    };
+                }
                 let latestStreamSession = 0;
                 this.addEventListener('message', (e) => {
                     if (!isCurrentStreamMessage(this, e.data)) return;
@@ -726,20 +735,29 @@
                 if (!parsedRequestUrl.pathname.includes('/channel/hls/') && (StreamInfosByUrl[url] || parsedRequestUrl.pathname.endsWith('.m3u8'))) {
                     const requestedStream = StreamInfosByUrl[url];
                     const requestId = requestedStream ? ++requestedStream.PlaylistRequestSequence : 0;
-                    return new Promise(function(resolve, reject) {
-                        const processAfter = async function(response) {
-                            if (response.status === 200) {
-                                resolve(new Response(await processM3U8(url, resolvePlaylistUrls(await response.text(), response.url || url), realFetch, requestId, requestedStream)));
-                            } else {
-                                resolve(response);
+                    return (async function() {
+                        try {
+                            let response;
+                            try {
+                                response = await realFetch(fetchInput(url), options);
+                            } catch (firstErr) {
+                                await new Promise(r => setTimeout(r, 200));
+                                response = await realFetch(fetchInput(url), options);
                             }
-                        };
-                        realFetch(fetchInput(url), options).then(function(response) {
-                            return processAfter(response);
-                        })['catch'](function(err) {
-                            reject(err);
-                        });
-                    });
+                            if (response.status === 200) {
+                                return new Response(await processM3U8(url, resolvePlaylistUrls(await response.text(), response.url || url), realFetch, requestId, requestedStream));
+                            }
+                            return response;
+                        } catch (err) {
+                            const cachedM3u8 = requestedStream?.LastProcessedPlaylist?.get(url) || requestedStream?.LastCleanNativeM3U8 || requestedStream?.RecoveryM3U8;
+                            if (cachedM3u8) {
+                                console.log('[AD DEBUG] Media playlist fetch failed (' + (err?.message || err) + ') — serving cached playlist to prevent ErrorNetworkIO crash and requesting reload');
+                                postStreamMessage(requestedStream, { key: 'ReloadPlayer', kind: 'early' });
+                                return new Response(cachedM3u8, { status: 200, headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+                            }
+                            throw err;
+                        }
+                    })();
                 } else if (url.includes('/channel/hls/') && !url.includes('picture-by-picture')) {
                     V2API = url.includes('/api/v2/');
                     const parsedUrl = new URL(url);
@@ -882,6 +900,23 @@
                             reject(err);
                         });
                     });
+                } else if (parsedRequestUrl.pathname.endsWith('.ts') || parsedRequestUrl.pathname.endsWith('.mp4')) {
+                    try {
+                        return await realFetch(input, options);
+                    } catch (segErr) {
+                        try {
+                            await new Promise(r => setTimeout(r, 150));
+                            return await realFetch(fetchInput(url), options);
+                        } catch (retryErr) {
+                            console.log('[AD DEBUG] Video segment fetch failed (' + (retryErr?.message || retryErr) + ') — substituting BLANK_MP4 and requesting reload to prevent ErrorNetworkIO crash');
+                            if (ActiveStreamInfo) {
+                                postStreamMessage(ActiveStreamInfo, { key: 'ReloadPlayer', kind: 'early' });
+                            } else {
+                                postMessage({ key: 'ReloadPlayer', kind: 'early' });
+                            }
+                            return new Response(BLANK_MP4, { status: 200, headers: { 'Content-Type': 'video/mp4' } });
+                        }
+                    }
                 }
             }
             return realFetch(input, options);
@@ -2325,19 +2360,21 @@
         video.addEventListener('pause', () => {
             if (!activeVideo() || isTabActuallyHidden()) return;
             const recentInput = (playerBufferState.pauseInputAt > 0
-                && Date.now() - playerBufferState.pauseInputAt <= 1500)
+                && Date.now() - playerBufferState.pauseInputAt <= 2000)
                 || (playerBufferState.userPauseIntent && playerBufferState.pauseIntentVideo === video && playerBufferState.pauseIntentSource === 'input');
-            if (!recentInput && playerBufferState.weJustPaused && Date.now() - playerBufferState.weJustPaused <= 2000) return;
+            if (!recentInput) {
+                // Ignore unprompted pause events: when Amazon IVS stops playback on ErrorNetworkIO
+                // or stalls during a stream switch, it emits a native pause event without user input.
+                // Setting userPauseIntent=true here would block automatic crash recovery.
+                return;
+            }
             playerBufferState.pauseInputVideo = null;
             playerBufferState.pauseInputAt = 0;
             playerBufferState.userPauseIntent = true;
             playerBufferState.pauseIntentVideo = video;
             playerBufferState.pauseIntentAt = Date.now();
-            playerBufferState.pauseIntentSource = recentInput ? 'input' : 'inferred';
-            recordTASDiagnostic({ event: 'pause-intent', source: playerBufferState.pauseIntentSource });
-            // Native media events alone cannot identify a user action. Give Twitch time
-            // to update its logical pause state before reconciling an inferred pause.
-            setTimeout(() => updatePlayerPauseIntent(getPlayerAndState()), 350);
+            playerBufferState.pauseIntentSource = 'input';
+            recordTASDiagnostic({ event: 'pause-intent', source: 'input' });
         });
         video.addEventListener('play', () => {
             if (activeVideo()) clearIntent('play');
@@ -2364,6 +2401,24 @@
             try {
                 const player = playerForMonitoringBuffering.player;
                 const state = playerForMonitoringBuffering.state;
+                const videoElForCrashCheck = player.getHTMLVideoElement?.();
+                const isUnexpectedlyStopped = state.props?.content?.type === 'live'
+                    && playerBufferState.hasStreamStarted
+                    && !playerBufferState.userPauseIntent
+                    && !doTwitchPlayerTask.recovery
+                    && (!playerBufferState.weJustPaused || Date.now() - playerBufferState.weJustPaused > 3000)
+                    && (!playerBufferState.lastReloadAt || Date.now() - playerBufferState.lastReloadAt > 8000)
+                    && (player.isPaused() || videoElForCrashCheck?.paused || videoElForCrashCheck?.ended);
+                if (isUnexpectedlyStopped) {
+                    playerBufferState.unexpectedStopTicks = (playerBufferState.unexpectedStopTicks || 0) + 1;
+                    if (playerBufferState.unexpectedStopTicks >= 3) {
+                        console.log('[AD DEBUG] Player unexpectedly stopped/crashed (ticks=' + playerBufferState.unexpectedStopTicks + ', paused=' + player.isPaused() + ', videoPaused=' + videoElForCrashCheck?.paused + ') — triggering hard reload');
+                        playerBufferState.unexpectedStopTicks = 0;
+                        doTwitchPlayerTask(false, true, 'early');
+                    }
+                } else {
+                    playerBufferState.unexpectedStopTicks = 0;
+                }
                 if (!player.core) {
                     playerForMonitoringBuffering = null;
                 } else if (state.props?.content?.type === 'live' && !player.isPaused() && !player.getHTMLVideoElement()?.ended && (player.getHTMLVideoElement()?.readyState ?? 0) >= 1 && playerBufferState.lastFixTime <= Date.now() - PlayerBufferingMinRepeatDelay && !isActivelyStrippingAds && !playerBufferState.inAdBreak && (!playerBufferState.lastReloadAt || Date.now() - playerBufferState.lastReloadAt >= 15000) && (!playerBufferState.lastBackupSwitchAt || Date.now() - playerBufferState.lastBackupSwitchAt >= 10000)) {
@@ -3052,8 +3107,8 @@
         }
         const playerPaused = player.isPaused();
         const wasPaused = playerPaused || player.core?.paused;
-        // Paused decoder internals can be the failure requiring a reset, not a user action.
-        const requiredReset = isReload && reloadKind === 'early' && !playerPaused && !document.pictureInPictureElement;
+        // Paused/stopped player state without userPauseIntent is a crash (e.g. ErrorNetworkIO) requiring a reset.
+        const requiredReset = isReload && (reloadKind === 'early' || !playerBufferState.userPauseIntent) && !document.pictureInPictureElement;
         if (wasPaused && !requiredReset) {
             if (playerBufferState.weJustPaused && (Date.now() - playerBufferState.weJustPaused) < 10000) {
                 try { player.play()?.catch?.(() => {}); } catch {}
@@ -3208,7 +3263,7 @@
                         observedVideo = video;
                         initialTime = video.currentTime;
                     }
-                    if (playedVideo === video && video.paused && current.player.core?.paused && current.player.isPaused()) { finish(false); return; }
+                    if (playedVideo === video && video.paused && playerBufferState.userPauseIntent) { finish(false); return; }
                     if (playedVideo !== video) {
                         playedVideo = video;
                         try {
@@ -3415,17 +3470,20 @@
                     }
                     if (ForceAccessTokenPlayerType && typeof init?.body === 'string' && init.body.includes('PlaybackAccessToken')) {
                         let replacedPlayerType = '';
+                        const shouldReplaceType = pt => pt && pt !== ForceAccessTokenPlayerType && pt !== 'picture-by-picture' && pt !== 'frontpage' && pt !== 'thunderdome';
                         const newBody = JSON.parse(init.body);
                         if (Array.isArray(newBody)) {
                             for (let i = 0; i < newBody.length; i++) {
-                                if (newBody[i]?.operationName?.includes('PlaybackAccessToken') && newBody[i]?.variables?.playerType && newBody[i]?.variables?.playerType !== ForceAccessTokenPlayerType) {
-                                    replacedPlayerType = newBody[i].variables.playerType;
+                                const pt = newBody[i]?.variables?.playerType;
+                                if (newBody[i]?.operationName?.includes('PlaybackAccessToken') && shouldReplaceType(pt)) {
+                                    replacedPlayerType = pt;
                                     newBody[i].variables.playerType = ForceAccessTokenPlayerType;
                                 }
                             }
                         } else {
-                            if (newBody?.operationName?.includes('PlaybackAccessToken') && newBody?.variables?.playerType && newBody?.variables?.playerType !== ForceAccessTokenPlayerType) {
-                                replacedPlayerType = newBody.variables.playerType;
+                            const pt = newBody?.variables?.playerType;
+                            if (newBody?.operationName?.includes('PlaybackAccessToken') && shouldReplaceType(pt)) {
+                                replacedPlayerType = pt;
                                 newBody.variables.playerType = ForceAccessTokenPlayerType;
                             }
                         }
@@ -3930,7 +3988,7 @@
         window.twitchAdSolutionsTools = { openSettings: show, diagnostics: getTASDiagnostics };
     }
     function onContentLoaded() {
-        initializeTASControls('vaft', '69.3.7');
+        initializeTASControls('vaft', '69.3.8');
         if (document.getElementById('seventv-extension')) {
             console.log('[AD DEBUG] Warning: 7TV extension detected — may cause black screen or buffering issues. If you experience problems, try disabling 7TV.');
         }
