@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         TwitchAdSolutions - VAFT + Auto Best Quality (No Background Downscale)
+// @name         TwitchAdSolutions - VAFT + Auto Best Quality
 // @namespace    https://github.com/DrV1rus/twitch-adblock-v1
 // @version      69.3.8
 // @description  TwitchAdSolutions + Best Quality default
